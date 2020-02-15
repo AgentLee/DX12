@@ -359,8 +359,257 @@ bool CheckTearingSupport()
 ComPtr<IDXGISwapChain4> CreateSwapChain(HWND hWnd, ComPtr<ID3D12CommandQueue> commandQueue,
 	uint32_t width, uint32_t height, uint32_t bufferCount)
 {
-	return nullptr;
+	ComPtr<IDXGISwapChain4> dxgiSwapChain4;
+	ComPtr<IDXGIFactory4> dxgiFactory4;
+
+	UINT createFactoryFlags = 0;
+
+#if defined(_DEBUG)
+	createFactoryFlags = DXGI_CREATE_FACTORY_DEBUG;
+#endif
+
+	ThrowIfFailed(CreateDXGIFactory2(createFactoryFlags, IID_PPV_ARGS(&dxgiFactory4)));
+
+	// Create a descriptor to describe how to create the swap chain.
+	DXGI_SWAP_CHAIN_DESC1 swapChainDesc = {};
+	swapChainDesc.Width = width;
+	swapChainDesc.Height = height;
+	swapChainDesc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+	swapChainDesc.Stereo = FALSE;
+	swapChainDesc.SampleDesc = { 1, 0 };
+	swapChainDesc.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
+	swapChainDesc.BufferCount = bufferCount;
+	swapChainDesc.Scaling = DXGI_SCALING_STRETCH;
+	swapChainDesc.SwapEffect = DXGI_SWAP_EFFECT_FLIP_DISCARD;
+	swapChainDesc.AlphaMode = DXGI_ALPHA_MODE_UNSPECIFIED;
+	swapChainDesc.Flags = CheckTearingSupport() ? DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING : 0;
+
+	// Use descriptor to create swap chain.
+	ComPtr<IDXGISwapChain1> swapChain1;
+	ThrowIfFailed(dxgiFactory4->CreateSwapChainForHwnd(
+		commandQueue.Get(),
+		hWnd,
+		&swapChainDesc,
+		nullptr,
+		nullptr,
+		&swapChain1
+	));
+
+	// Disable ALT+ENTER fullscreen toggle
+	ThrowIfFailed(dxgiFactory4->MakeWindowAssociation(hWnd, DXGI_MWA_NO_ALT_ENTER));
+
+	// Convert swap chain to IDXGISwapChain4
+	ThrowIfFailed(swapChain1.As(&dxgiSwapChain4));
+
+	return dxgiSwapChain4;
 }
+
+// CREATING THE DESCRIPTOR HEAP -------------------
+ComPtr<ID3D12DescriptorHeap> CreateDescriptorHeap(ComPtr<ID3D12Device2> device, 
+	D3D12_DESCRIPTOR_HEAP_TYPE type, 
+	uint32_t numDescriptors, 
+	D3D12_DESCRIPTOR_HEAP_FLAGS flags = D3D12_DESCRIPTOR_HEAP_FLAG_NONE,
+	UINT nodeMask = 0)
+{
+	ComPtr<ID3D12DescriptorHeap> descriptorHeap;
+
+	// Describe how to create descriptor heap.
+	D3D12_DESCRIPTOR_HEAP_DESC desc = {};
+	desc.NumDescriptors = numDescriptors;
+	desc.Type			= type;					
+	desc.Flags			= flags;				// VISIBLE is for CBV, SRV, UAV to indicate shader binding
+	desc.NodeMask		= nodeMask;				// Important for multiple adapter operations
+
+	// Create descriptor heap through the device.
+	ThrowIfFailed(device->CreateDescriptorHeap(&desc, IID_PPV_ARGS(&descriptorHeap)));
+
+	return descriptorHeap;
+}
+
+void UpdateRenderTargetViews(ComPtr<ID3D12Device2> device,
+	ComPtr<IDXGISwapChain4> swapChain, ComPtr<ID3D12DescriptorHeap> descriptorHeap)
+{
+	// Account for different hardware descriptor sizes.
+	auto rtvDescriptorSize = device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
+
+	// Pointer to a descriptor in the descriptor heap.
+	CD3DX12_CPU_DESCRIPTOR_HANDLE rtvHandle(descriptorHeap->GetCPUDescriptorHandleForHeapStart());
+	
+	// Iterate over descriptors.
+	for (int i = 0; i < g_numFrames; ++i)
+	{
+		// Get the backbuffer at current frame and store in backBuffer.
+		ComPtr<ID3D12Resource> backBuffer;
+		ThrowIfFailed(swapChain->GetBuffer(i, IID_PPV_ARGS(&backBuffer)));
+
+		// Create RTV from backbuffer that contains RT resource.
+		// Use current position of the rtvHandle to reference.
+		device->CreateRenderTargetView(backBuffer.Get(), nullptr, rtvHandle);
+
+		// Store for state transitioning.
+		g_backBuffers[i] = backBuffer;
+
+		// Get the next descriptor in heap.
+		rtvHandle.Offset(rtvDescriptorSize);
+	}
+}
+
+// Command allocators are used as a memory buffer for command lists.
+// Command lists have access to the allocator.
+// Each allocator can only be used by one list at a time.
+// Fences are used to check if the commands are finished running on GPU.
+ComPtr<ID3D12CommandAllocator> CreateCommandAllocator(ComPtr<ID3D12Device2> device, D3D12_COMMAND_LIST_TYPE type)
+{
+	ComPtr<ID3D12CommandAllocator> commandAllocator;
+	ThrowIfFailed(device->CreateCommandAllocator(type, IID_PPV_ARGS(&commandAllocator)));
+
+	return commandAllocator;
+}
+
+// Command lists are used to hold instructions to run on the GPU.
+// Command lists need to be reset before being able to be reused.
+ComPtr<ID3D12GraphicsCommandList> CreateCommandList(ComPtr<ID3D12Device2> device,
+	ComPtr<ID3D12CommandAllocator> commandAllocator, 
+	D3D12_COMMAND_LIST_TYPE type, 
+	UINT nodeMask)
+{
+	ComPtr<ID3D12GraphicsCommandList> commandList;
+	ThrowIfFailed(device->CreateCommandList(nodeMask, type, commandAllocator.Get(), nullptr, IID_PPV_ARGS(&commandList)))
+;
+	ThrowIfFailed(commandList->Close());
+
+	return commandList;
+}
+
+// Fences are used for GPU or CPU syncronization.
+// device is where we create the fence for
+// initialValue is the initial value stored in the fence when it gets created.
+// This value gets updated on the CPU when Fence.Signal() is called and 
+// gets updated on the GPU when CommandQueue.Signal() is called.
+// Fence.SetEventOnCompletion() is used to wait for a fence to reach value on CPU.
+// CommandQueue.Wait() is used to wait for fence to reach value on GPU.
+ComPtr<ID3D12Fence> CreateFence(ComPtr<ID3D12Device2> device, 
+	UINT64 initialValue = 0, 
+	D3D12_FENCE_FLAGS flags = D3D12_FENCE_FLAG_NONE)
+{
+	ComPtr<ID3D12Fence> fence;
+	ThrowIfFailed(device->CreateFence(initialValue, flags, IID_PPV_ARGS(&fence)));
+
+	return fence;
+}
+
+HANDLE CreateEventHandle()
+{
+	HANDLE fenceEvent;
+	fenceEvent = ::CreateEvent(NULL, FALSE, FALSE, NULL);
+	assert(fenceEvent && "Failed to create fence event");
+
+	return fenceEvent;
+}
+
+// Signal the fence from the GPU.
+// Fence is signaled when the GPU gets to that point during execution.
+// ie, commands that are being executed need to be finished before this
+// fence gets signaled with this value.
+// The fence value that gets returned to the CPU is to tell the CPU
+// to wait for this value while the GPU executes its command queue.
+uint64_t Signal(ComPtr<ID3D12CommandQueue> commandQueue,
+	ComPtr<ID3D12Fence> fence,
+	uint64_t& fenceValue)
+{
+	uint64_t fenceValueForSignal = ++fenceValue;
+	ThrowIfFailed(commandQueue->Signal(fence.Get(), fenceValue));
+
+	return fenceValueForSignal;
+}
+
+// In the event that the CPU needs to wait for the GPU to finish...
+// Commands that use any of the backbuffer's resources need to complete
+// before being able to reuse the resource.
+// Writable resources (RTs) need to synced to prevent multiple queues
+// from overwriting it at the same time.
+void WaitForFenceValue(ComPtr<ID3D12Fence> fence,
+	uint64_t fenceValue,
+	HANDLE fenceEvent,
+	std::chrono::milliseconds duration = std::chrono::milliseconds::max())
+{
+	// Check to see if the fence reached the value.
+	if (fence->GetCompletedValue() < fenceValue)
+	{
+		// Register event with the fence to execute once the value reaches its target.
+		throw(fence->SetEventOnCompletion(fenceValue, fenceEvent));
+		// Stall CPU thread
+		::WaitForSingleObject(fenceEvent, static_cast<DWORD>(duration.count()));
+	}
+}
+
+// Flush() is called to make sure the GPU finishes all the commands before continuing.
+// Resizing requires the resources to be let go beforehand.
+// This will block calling thread until fence value is reached.
+void Flush(ComPtr<ID3D12CommandQueue> commandQueue,
+	ComPtr<ID3D12Fence> fence,
+	uint64_t& fenceValue,
+	HANDLE fenceEvent)
+{
+	// Get value to wait for.
+	uint64_t fenceValueForSignal = Signal(commandQueue, fence, fenceValue);
+	// Wait for fence to be signaled.
+	WaitForFenceValue(fence, fenceValueForSignal, fenceEvent);
+}
+
+void Update()
+{
+	static uint64_t frameCounter = 0;
+	static double elapsedSeconds = 0.0;
+	static std::chrono::high_resolution_clock clock;
+	static auto t0 = clock.now();
+
+	frameCounter++;
+	auto t1 = clock.now();
+	auto deltaTime = t1 - t0;
+	t0 = t1;
+
+	elapsedSeconds += deltaTime.count() * 1e-9;
+	if (elapsedSeconds > 1.0)
+	{
+		char buffer[500];
+		auto fps = frameCounter / elapsedSeconds;
+		sprintf_s(buffer, 500, "FPS: %f\n", fps);
+		OutputDebugString(buffer);
+
+		frameCounter = 0;
+		elapsedSeconds = 0.0;
+	}
+}
+
+//void Render()
+//{
+//	auto commandAllocator = g_commandAllocators[g_currBackBufferIndex];
+//	auto backBuffer = g_backBuffers[g_currBackBufferIndex];
+//
+//	commandAllocator->Reset();
+//	g_commandList->Reset(commandAllocator.Get(), nullptr);
+//
+//	// Clear render target
+//	{
+//		CD3DX12_RESOURCE_BARRIER barrier = CD3DX12_RESOURCE_BARRIER::Transition(
+//			backBuffer.Get(),
+//			D3D12_RESOURCE_STATE_PRESENT, D3D12_RESOURCE_STATE_RENDER_TARGET);
+//
+//		g_commandList->ResourceBarrier(1, &barrier);
+//
+//		FLOAT clearColor[] = { 0.4f, 0.6f, 0.9f, 1.0f };
+//		CD3DX12_CPU_DESCRIPTOR_HANDLE rtv(g_RTVDescriptorHeap->GetCPUDescriptorHandleForHeapStart(),
+//			g_currBackBufferIndex, g_RTVDescriptorSize);
+//
+//		g_commandList->ClearRenderTargetView(rtv, clearColor, 0, nullptr);
+//	}
+//
+//	// Present
+//	{
+//		CD3DX12_RESOURCE_BARRIER barrier = CD3DX12_RESOURCE_BARRIER
+//	}
+//}
 
 int main()
 {
